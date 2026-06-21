@@ -1002,9 +1002,51 @@ async def build_reply(req: EvolutionInbound) -> WorkerReply:
     return reply
 
 
+def post_process_test_flow(req: EvolutionInbound, reply: WorkerReply) -> WorkerReply:
+    """Pós-processa a resposta do LLM/regras pra aplicar a lógica do fluxo de teste.
+
+    O LLM costuma marcar human_handoff=true em todo pedido de teste, o que
+    impede o RPA de disparar. Esta função decide o handoff com base no
+    estado real da conversa (aparelho detectado ou não).
+    """
+    if reply.intent != "gerar_teste":
+        return reply
+
+    await_state = store.get_state(req.number)
+    device = reply.metadata.get("device") or detect_device(req.text)
+
+    # Cliente disse o aparelho junto com o pedido de teste, OU estava aguardando
+    # aparelho e acabou de responder → temos tudo pra gerar o teste.
+    if device and (await_state == "await_device" or not await_state):
+        store.clear_state(req.number)
+        store.set_device(req.number, device)
+        reply.metadata["device"] = device
+        reply.metadata["test_ready_to_generate"] = True
+        reply.human_handoff = True
+        reply.handoff_reason = f"cliente pediu teste para {device}; acionar ativação/RPA"
+        reply.reply_text = (
+            f"Perfeito 😊 Vou gerar seu teste pra {device}.\n"
+            "Só um instante que já te mando os dados."
+        )
+        return reply
+
+    # Cliente pediu teste mas não disse o aparelho → pergunta e ativa estado.
+    # NÃO faz handoff (não há nada pro humano/RPA fazer ainda).
+    store.set_state(req.number, "await_device")
+    reply.metadata["await_state"] = "await_device"
+    reply.metadata["test_ready_to_generate"] = False
+    reply.human_handoff = False
+    reply.handoff_reason = None
+    if not req.text or detect_device(req.text) is None:
+        reply.reply_text = "Claro 😊 Eu gero o teste por aqui.\nMe diz só em qual aparelho vai usar?"
+    return reply
+
+
 async def reply_for(req: EvolutionInbound) -> WorkerReply:
     start = time.perf_counter()
     reply = await build_reply(req)
+    # Pós-processa o fluxo de teste ANTES do sanitize (corrige handoff do LLM).
+    reply = post_process_test_flow(req, reply)
     reply = sanitize_reply(req, reply)
     store.save_interaction(req, reply)
     latency_ms = round((time.perf_counter() - start) * 1000, 2)
