@@ -68,6 +68,9 @@ BRAIN_PATH = Path(os.getenv("CAROLINNE_BRAIN_PATH", "carolinne_brain.md"))
 RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "20"))
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "3600"))  # segundos
 
+# RPA SSTV — automação de geração de teste no painel sstv.center
+SSTV_RPA_ENABLED = os.getenv("SSTV_RPA_ENABLED", "false").lower() == "true"
+
 # ---------------------------------------------------------------------------
 # Logging estruturado
 # ---------------------------------------------------------------------------
@@ -248,6 +251,15 @@ class Store:
         else:
             self.memory.pop(key, None)
 
+    # ---- aparelho escolhido pelo cliente (usado no fluxo de teste) ----
+    def set_device(self, number: str, device: str) -> None:
+        record = self._get_json(f"customer:{number}")
+        record["device"] = device
+        self._set_json(f"customer:{number}", record)
+
+    def get_device(self, number: str) -> Optional[str]:
+        return self._get_json(f"customer:{number}").get("device")
+
     # ---- cliente ----
     def get_customer(self, number: str) -> Dict[str, Any]:
         return self._get_json(f"customer:{number}")
@@ -315,6 +327,38 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.lower()).strip()
 
 
+# Palavras que indicam aparelho (usado pra desambiguar teste + aparelho)
+DEVICE_KEYWORDS = [
+    "fire", "firestick", "fire stick", "apple tv", "roku", "samsung", "lg ",
+    "iphone", "ipad", "android", "celular", "telefone", "tv box", "android tv",
+    "google tv", "smart tv", "max player", "vizzion", "xcloud", "smarters",
+]
+
+
+def detect_device(text: str) -> Optional[str]:
+    """Retorna o nome do aparelho reconhecido na mensagem, ou None."""
+    t = normalize(text)
+    if "apple tv" in t:
+        return "Apple TV"
+    if "fire" in t or "firestick" in t:
+        return "Fire Stick"
+    if "roku" in t:
+        return "Roku"
+    if "samsung" in t:
+        return "Samsung"
+    if "lg " in t or t.startswith("lg") or "lg." in t:
+        return "LG"
+    if "iphone" in t or "ipad" in t:
+        return "iPhone/iPad"
+    if "android tv" in t or "google tv" in t or "tv box" in t:
+        return "Android TV/TV Box"
+    if "celular" in t or "telefone" in t or ("android" in t and "tv" not in t):
+        return "Celular Android"
+    if "smart tv" in t:
+        return "Smart TV"
+    return None
+
+
 def detect_intent(text: str) -> str:
     t = normalize(text)
     if not t:
@@ -343,12 +387,19 @@ def detect_intent(text: str) -> str:
     ]
     if len(t) <= 35 and any(re.search(p, t) for p in greeting_patterns):
         return "saudacao"
+
+    # Detecta se a mensagem menciona um aparelho. Se sim, prioriza "apps"
+    # em vez de "gerar_teste" — evita o loop de perguntar o aparelho de novo.
+    has_device = any(k in t for k in DEVICE_KEYWORDS) or detect_device(t) is not None
+
     # Matching por palavra-chave com filtro de negação
     for intent, keywords in INTENTS.items():
+        if intent == "gerar_teste" and has_device:
+            # Cliente misturou teste + aparelho ("quero teste no fire stick"):
+            # tratar como apps pra responder sobre o aparelho.
+            continue
         if any(k in t for k in keywords):
-            # Ex.: "não quero pix" não deve virar intent de pix.
             if any(neg in t for neg in NEGATIONS):
-                # mantém fallback em vez de afirmar a intenção negada
                 continue
             return intent
     return "fallback"
@@ -457,12 +508,65 @@ def rules_reply(req: EvolutionInbound) -> WorkerReply:
 
     if intent == "saudacao":
         return greeting_for(req)
+
+    # Fluxo de teste: prioriza detectar o aparelho, evita loop de perguntar de novo.
+    await_state = store.get_state(req.number)
+    device = detect_device(req.text)
+    requested_test_before = bool(store.get_customer(req.number).get("requested_test"))
+
+    # Caso A: cliente já tinha pedido teste e agora respondeu o aparelho.
+    if await_state == "await_device" and device:
+        store.clear_state(req.number)
+        store.set_device(req.number, device)
+        return WorkerReply(
+            intent="gerar_teste",
+            human_handoff=True,
+            handoff_reason=f"cliente pediu teste para {device}; acionar ativação/RPA",
+            reply_text=(
+                f"Perfeito 😊 Vou gerar seu teste pra {device}.\n"
+                "Só um instante que já te mando os dados."
+            ),
+            metadata={"device": device, "test_ready_to_generate": True},
+        )
+
+    # Caso B: cliente pede teste mencionando o aparelho de cara ("teste no fire stick").
+    if intent == "gerar_teste" and device:
+        store.set_device(req.number, device)
+        return WorkerReply(
+            intent="gerar_teste",
+            human_handoff=True,
+            handoff_reason=f"cliente pediu teste para {device}; acionar ativação/RPA",
+            reply_text=(
+                f"Perfeito 😊 Vou gerar seu teste pra {device}.\n"
+                "Só um instante que já te mando os dados."
+            ),
+            metadata={"device": device, "test_ready_to_generate": True},
+        )
+
+    # Caso C: cliente pede teste sem dizer aparelho → pergunta e ativa estado.
     if intent == "gerar_teste":
+        store.set_state(req.number, "await_device")
         return WorkerReply(
             intent=intent,
+            human_handoff=False,
+            reply_text="Claro 😊 Eu gero o teste por aqui.\nMe diz só em qual aparelho vai usar?",
+            metadata={"await_state": "await_device"},
+        )
+
+    # Caso D: cliente respondeu o aparelho mas a frase virou intent "apps" (sem contexto de teste).
+    # Se estava aguardando aparelho, registra e confirma.
+    if await_state == "await_device" and intent == "apps" and device:
+        store.clear_state(req.number)
+        store.set_device(req.number, device)
+        return WorkerReply(
+            intent="gerar_teste",
             human_handoff=True,
-            handoff_reason="cliente pediu teste; acionar ativação internamente",
-            reply_text="Claro. Eu gero o teste por aqui.\nMe diz só em qual aparelho vai usar?",
+            handoff_reason=f"cliente pediu teste para {device}; acionar ativação/RPA",
+            reply_text=(
+                f"Perfeito 😊 Vou gerar seu teste pra {device}.\n"
+                "Só um instante que já te mando os dados."
+            ),
+            metadata={"device": device, "test_ready_to_generate": True},
         )
     if intent == "planos":
         return WorkerReply(intent=intent, reply_text="Claro. Você está em qual país?\nAí te passo os valores na moeda certinha.")
@@ -706,17 +810,20 @@ def sanitize_reply(req: EvolutionInbound, reply: WorkerReply) -> WorkerReply:
     """Filtro de segurança final antes de salvar/enviar ao WhatsApp."""
     text = reply.reply_text or ""
     leaked = any(re.search(p, text, flags=re.I) for p in INTERNAL_LINK_PATTERNS)
-    for pattern in INTERNAL_LINK_PATTERNS:
-        text = re.sub(pattern, "", text, flags=re.I).strip()
 
-    detected = detect_intent(req.text)
-    if leaked or detected == "gerar_teste" or reply.intent == "gerar_teste":
+    # BLOQUEIO DE SEGURANÇA — só age quando há LEAK REAL de link interno.
+    # Antes reescrevia em todo "gerar_teste", o que causava loop. Agora respeita
+    # a resposta do LLM/regras quando não há link vazado.
+    if leaked:
         text = "Claro. Eu gero o teste por aqui.\nMe diz só em qual aparelho vai usar?"
         reply.intent = "gerar_teste"
         reply.human_handoff = True
-        reply.handoff_reason = reply.handoff_reason or "cliente pediu teste; setor de ativação precisa gerar internamente"
-        if leaked:
-            reply.metadata["safety_filter"] = "blocked_internal_test_link"
+        reply.handoff_reason = "IA tentou enviar link interno de teste (bloqueado pelo filtro de segurança)"
+        reply.metadata["safety_filter"] = "blocked_internal_test_link"
+    else:
+        # Limpa qualquer padrão que tenha escapado (defesa em profundidade).
+        for pattern in INTERNAL_LINK_PATTERNS:
+            text = re.sub(pattern, "", text, flags=re.I).strip()
 
     t = normalize(req.text)
     if any(k in t for k in ["áudio", "audio", "ligação", "ligacao"]):
@@ -979,13 +1086,28 @@ async def notify_human(req: EvolutionInbound, reply: WorkerReply) -> Optional[Di
     if not reply.human_handoff or not EMILIANO_PHONE:
         return None
     await supabase_insert_handoff(req, reply)
-    alert = (
-        "🚨 Carolinne pediu atendimento humano\n"
-        f"Cliente: {req.pushName or 'sem nome'}\n"
-        f"WhatsApp: {req.number}\n"
-        f"Motivo: {reply.handoff_reason or 'não informado'}\n"
-        f"Mensagem: {req.text}"
-    )
+    # Inclui o aparelho detectado quando existir (fluxo de teste).
+    device = reply.metadata.get("device") or store.get_device(req.number)
+    is_test = reply.intent == "gerar_teste" and reply.metadata.get("test_ready_to_generate")
+    if is_test:
+        alert = (
+            "🧪 NOVO TESTE SOLICITADO\n"
+            f"👤 Cliente: {req.pushName or 'sem nome'}\n"
+            f"📱 WhatsApp: {req.number}\n"
+            f"📺 Aparelho: {device or 'não informado'}\n"
+            f"💬 Mensagem: {req.text}\n\n"
+            f"➡️ Gere o teste no painel SSTV e envie as credenciais ao cliente."
+        )
+    else:
+        alert = (
+            "🚨 Carolinne pediu atendimento humano\n"
+            f"Cliente: {req.pushName or 'sem nome'}\n"
+            f"WhatsApp: {req.number}\n"
+            f"Motivo: {reply.handoff_reason or 'não informado'}\n"
+            f"Mensagem: {req.text}"
+        )
+        if device:
+            alert += f"\nAparelho: {device}"
     return await send_evolution_text(EMILIANO_PHONE, alert)
 
 
@@ -1183,6 +1305,78 @@ async def evolution_inbound_direct(
         handoff_result = await notify_human(req, reply)
     except Exception as exc:
         handoff_result = {"error": str(exc)[:300]}
+
+    # ---- RPA SSTV (geração automática de teste) ----
+    # Se o cliente pediu teste E já tem aparelho E o RPA está ativado,
+    # dispara o robô em background e envia credenciais ao cliente quando pronto.
+    rpa_result = None
+    if (
+        reply.intent == "gerar_teste"
+        and reply.metadata.get("test_ready_to_generate")
+        and SSTV_RPA_ENABLED
+    ):
+        device = reply.metadata.get("device") or store.get_device(req.number)
+        try:
+            from sstv_rpa import gerar_teste_sstv, formatar_mensagem_cliente
+
+            # Avisa o cliente que está gerando
+            await send_evolution_text(
+                req.number,
+                "Estou gerando seu teste agora 🔧 Só um minutinho...",
+            )
+            log_event("rpa_started", number=req.number, device=device)
+
+            # Roda o robô (síncrono dentro do request — pode levar 30-90s)
+            result = await gerar_teste_sstv(
+                device=device or "",
+                cliente_nome=req.pushName or "",
+                cliente_numero=req.number,
+            )
+
+            if result.success and result.username and result.password:
+                # Envia as credenciais formatadas pro aparelho do cliente
+                mensagens = formatar_mensagem_cliente(result, device or "")
+                if mensagens:
+                    await send_evolution_messages(req.number, mensagens)
+                log_event("rpa_success", number=req.number, device=device)
+                rpa_result = {"success": True, "username": result.username}
+                # Atualiza o record do cliente
+                record = store.get_customer(req.number)
+                record["test_username"] = result.username
+                record["test_generated_at"] = datetime.now(timezone.utc).isoformat()
+                store._set_json(f"customer:{req.number}", record)
+                # Avisa o Emiliano que o teste foi gerado automaticamente
+                if EMILIANO_PHONE:
+                    await send_evolution_text(
+                        EMILIANO_PHONE,
+                        f"✅ Teste gerado automaticamente\n"
+                        f"Cliente: {req.pushName or 'sem nome'}\n"
+                        f"WhatsApp: {req.number}\n"
+                        f"Aparelho: {device or 'não informado'}\n"
+                        f"Usuário: {result.username}",
+                    )
+            else:
+                # RPA falhou — avisa o cliente e escala pro Emiliano
+                log_event("rpa_failed", number=req.number, device=device, error=result.error)
+                await send_evolution_text(
+                    req.number,
+                    "Tive um probleminha pra gerar seu teste automaticamente 😕 "
+                    "Já avisei o setor e vou te enviar os dados o mais rápido possível!",
+                )
+                if EMILIANO_PHONE:
+                    await send_evolution_text(
+                        EMILIANO_PHONE,
+                        f"⚠️ RPA FALHOU — gerar teste manualmente\n"
+                        f"Cliente: {req.pushName or 'sem nome'}\n"
+                        f"WhatsApp: {req.number}\n"
+                        f"Aparelho: {device or 'não informado'}\n"
+                        f"Erro: {result.error}",
+                    )
+                rpa_result = {"success": False, "error": result.error}
+        except Exception as exc:
+            log_event("rpa_error", number=req.number, error=str(exc)[:300])
+            rpa_result = {"success": False, "error": str(exc)[:300]}
+
     return {
         "ok": True,
         "sent": True,
@@ -1192,4 +1386,5 @@ async def evolution_inbound_direct(
         "messages_sent": len(all_messages),
         "send_result": send_result,
         "handoff_result": handoff_result,
+        "rpa_result": rpa_result,
     }
