@@ -58,7 +58,7 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic").lower()  # anthropic | ope
 LLM_BASE_URL = os.getenv("LLM_BASE_URL") or os.getenv(
     "OPENAI_BASE_URL", "https://api.anthropic.com/v1"
 )
-LLM_MODEL = os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL", "claude-sonnet-4-20250514")
+LLM_MODEL = os.getenv("LLM_MODEL") or os.getenv("OPENAI_MODEL", "claude-sonnet-4-5-20250929")
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "18"))
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.4"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "300"))
