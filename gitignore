@@ -1,0 +1,22 @@
+# Segredos — nunca versionar
+.env
+.env.*
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# SO / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

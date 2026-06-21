@@ -1,0 +1,26 @@
+# Evita vazar segredos e arquivos desnecessários para a imagem Docker.
+.env
+.env.*
+!.env.example
+*.env
+.git
+.gitignore
+.github
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+tests/
+04-testes/
+05-futuro-rpa-sstv/
+*.md
+!carolinne_brain.md
+Dockerfile
+.dockerignore
+docker-compose*.yml
