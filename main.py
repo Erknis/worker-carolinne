@@ -20,7 +20,7 @@ except Exception:  # pragma: no cover
     redis = None
 
 # ---------------------------------------------------------------------------
-# Configuração (settings)
+# Configuração
 # ---------------------------------------------------------------------------
 APP_NAME = os.getenv("BOT_NAME", "Carolinne")
 API_KEY = os.getenv("CAROLINNE_WORKER_API_KEY", "")
@@ -68,12 +68,11 @@ BRAIN_PATH = Path(os.getenv("CAROLINNE_BRAIN_PATH", "carolinne_brain.md"))
 RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "20"))
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "3600"))  # segundos
 
-# RPA SSTV — automação de geração de teste no painel sstv.center
+# RPA SSTV — o robô agora roda num serviço separado (worker-rpa-sstv).
+# O worker só faz uma chamada HTTP pra ele.
 SSTV_RPA_ENABLED = os.getenv("SSTV_RPA_ENABLED", "false").lower() == "true"
-SSTV_LOGIN_URL = os.getenv("SSTV_LOGIN_URL", "https://sstv.center/")
-SSTV_USER = os.getenv("SSTV_USER", "")
-SSTV_PASS = os.getenv("SSTV_PASS", "")
-TWOCAPTCHA_API_KEY = os.getenv("TWOCAPTCHA_API_KEY", "")
+RPA_SERVICE_URL = os.getenv("RPA_SERVICE_URL", "http://liberoutv_worker-rpa-sstv:8001")
+RPA_API_KEY = os.getenv("RPA_API_KEY", "")
 
 # ---------------------------------------------------------------------------
 # Logging estruturado
@@ -1107,6 +1106,81 @@ async def send_evolution_text(number: str, text: str) -> Dict[str, Any]:
             return {"status_code": response.status_code, "text": response.text[:500]}
 
 
+def formatar_credenciais_cliente(username: str, password: str, device: str = "", validade: str = "") -> List[str]:
+    """Formata as credenciais do teste em mensagens WhatsApp por aparelho.
+
+    Manda APENAS as instruções relevantes pro aparelho do cliente, nunca o popup inteiro.
+    Retorna uma lista de balões (mensagens separadas).
+    """
+    messages = []
+    d = (device or "").lower()
+
+    # Mensagem 1 — credenciais
+    msg = (
+        f"CREDENCIAIS DE ACESSO\n"
+        f"✅ Usuário: {username}\n"
+        f"✅ Senha: {password}"
+    )
+    if validade:
+        msg += f"\n⏰ Válido até: {validade}"
+    messages.append(msg)
+
+    # Mensagem 2 — instruções por aparelho
+    if "apple tv" in d:
+        messages.append(
+            "Na Apple TV, abra o Max Player.\n"
+            "Acesso: Usuário + Senha + DNS\n"
+            "DNS: http://stv.cx"
+        )
+    elif "fire" in d or "android tv" in d or "google tv" in d or "tv box" in d:
+        messages.append(
+            "No Fire Stick/Android TV, use o Downloader.\n"
+            "Downloader: 952155 ou 5269346\n"
+            "Vai instalar o STV.1 (Auto Update).\n\n"
+            "Acesso: Usuário + Senha + DNS\n"
+            "DNS: http://stv.cx"
+        )
+    elif "roku" in d or "samsung" in d or "lg" in d:
+        messages.append(
+            "Na sua TV, use o Vizzion Play.\n"
+            "Ao abrir, clique em entrar com código.\n"
+            "Código: 646482 ou 018270 ou 161070\n\n"
+            "Depois informe Usuário + Senha."
+        )
+    elif "iphone" in d or "ipad" in d:
+        messages.append(
+            "No iPhone/iPad, use o XCloud TV ou Vizzion Play.\n"
+            "Se XCloud: ServerSSTV + Usuário + Senha\n"
+            "Se Vizzion: Código 646482 + Usuário + Senha"
+        )
+    elif "celular" in d or "android" in d:
+        messages.append(
+            "No celular Android, instale o app:\n"
+            "https://sdev.cx/stvnovo.apk\n\n"
+            "Acesso: Usuário + Senha + DNS\n"
+            "DNS: http://stv.cx"
+        )
+    else:
+        messages.append(
+            "DNS (URL): http://stv.cx\n\n"
+            "Me diz qual aparelho você vai usar que eu te mando o passo a passo 😊"
+        )
+
+    # Mensagem 3 — aviso de maiúsculas/minúsculas (sempre)
+    messages.append(
+        "ATENÇÃO 🚨\n\n"
+        "Cuidado com as letras maiúsculas e minúsculas para saírem corretamente.\n"
+        "Letras que mais costumam enganar:\n\n"
+        "K - k\n"
+        "I (i maiúsculo) com l (L minúsculo) - l\n"
+        "S - s\n"
+        "O - o\n"
+        "V - v\n"
+        "W - w"
+    )
+    return messages
+
+
 async def send_evolution_messages(number: str, messages: List[str]) -> List[Dict[str, Any]]:
     """Envia várias mensagens ao cliente com pausa entre elas.
 
@@ -1285,62 +1359,40 @@ async def preview(req: EvolutionInbound, x_api_key: Optional[str] = Header(defau
 
 @app.get("/rpa/test")
 async def rpa_test(x_api_key: Optional[str] = Header(default=None), api_key: Optional[str] = Query(default=None)) -> Dict[str, Any]:
-    """Diagnóstico do RPA: testa Playwright, login do SSTV e captura erros passo a passo."""
+    """Diagnóstico do RPA: testa conexão com o serviço RPA separado."""
     check_api_key(x_api_key, api_key)
 
-    result: Dict[str, Any] = {"steps": [], "config": {}}
-
-    # Verifica config
-    result["config"] = {
-        "sstv_rpa_enabled": SSTV_RPA_ENABLED,
-        "sstv_login_url": SSTV_LOGIN_URL,
-        "sstv_user": SSTV_USER[:3] + "***" if SSTV_USER else "(vazio)",
-        "sstv_pass": "***" if SSTV_PASS else "(vazio)",
-        "twocaptcha_key": TWOCAPTCHA_API_KEY[:6] + "***" if TWOCAPTCHA_API_KEY else "(vazio)",
+    result: Dict[str, Any] = {
+        "config": {
+            "sstv_rpa_enabled": SSTV_RPA_ENABLED,
+            "rpa_service_url": RPA_SERVICE_URL,
+            "rpa_api_key": RPA_API_KEY[:6] + "***" if RPA_API_KEY else "(vazio)",
+        },
+        "steps": [],
     }
 
-    # Passo 1: Playwright importável?
+    # Testa conexão com o serviço RPA
     try:
-        from playwright.async_api import async_playwright
-        result["steps"].append({"step": "import_playwright", "ok": True})
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{RPA_SERVICE_URL.rstrip('/')}/health",
+                headers={"X-API-Key": RPA_API_KEY} if RPA_API_KEY else {},
+            )
+            result["steps"].append({
+                "step": "connect_rpa_service",
+                "ok": resp.status_code == 200,
+                "status": resp.status_code,
+                "body": resp.text[:200],
+            })
     except Exception as exc:
-        result["steps"].append({"step": "import_playwright", "ok": False, "error": str(exc)[:200]})
-        result["summary"] = "Playwright não está instalado no container. Verifique requirements.txt + Dockerfile."
-        return result
+        result["steps"].append({
+            "step": "connect_rpa_service",
+            "ok": False,
+            "error": str(exc)[:200],
+            "hint": "Verifique se o serviço worker-rpa-sstv está rodando no EasyPanel",
+        })
 
-    # Passo 2: Chromium lança?
-    try:
-        from playwright.async_api import async_playwright
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            result["steps"].append({"step": "chromium_launch", "ok": True})
-            # Passo 3: Abre página de login?
-            try:
-                await page.goto(SSTV_LOGIN_URL, wait_until="networkidle", timeout=30000)
-                title = await page.title()
-                result["steps"].append({"step": "open_login_page", "ok": True, "title": title, "url": page.url})
-                # Captura parte do HTML pra ver a estrutura
-                body_text = (await page.inner_text("body"))[:500]
-                result["steps"].append({"step": "login_page_text", "text_preview": body_text[:300]})
-            except Exception as exc:
-                result["steps"].append({"step": "open_login_page", "ok": False, "error": str(exc)[:200]})
-            await browser.close()
-    except Exception as exc:
-        result["steps"].append({"step": "chromium_launch", "ok": False, "error": str(exc)[:200]})
-        result["summary"] = "Chromium não conseguiu iniciar (deps do sistema faltando?)"
-        return result
-
-    # Passo 4: Testa 2Captcha (saldo)
-    if TWOCAPTCHA_API_KEY:
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(f"https://2captcha.com/res.php?key={TWOCAPTCHA_API_KEY}&action=getbalance")
-                result["steps"].append({"step": "twocaptcha_balance", "ok": True, "response": resp.text})
-        except Exception as exc:
-            result["steps"].append({"step": "twocaptcha_balance", "ok": False, "error": str(exc)[:200]})
-
-    result["summary"] = "Diagnóstico completo. Veja os steps acima."
+    result["summary"] = "Diagnóstico completo."
     return result
 
 
@@ -1428,9 +1480,7 @@ async def evolution_inbound_direct(
     except Exception as exc:
         handoff_result = {"error": str(exc)[:300]}
 
-    # ---- RPA SSTV (geração automática de teste) ----
-    # Se o cliente pediu teste E já tem aparelho E o RPA está ativado,
-    # dispara o robô em background e envia credenciais ao cliente quando pronto.
+    # ---- RPA SSTV (geração automática de teste via serviço separado) ----
     rpa_result = None
     if (
         reply.intent == "gerar_teste"
@@ -1439,8 +1489,6 @@ async def evolution_inbound_direct(
     ):
         device = reply.metadata.get("device") or store.get_device(req.number)
         try:
-            from sstv_rpa import gerar_teste_sstv, formatar_mensagem_cliente
-
             # Avisa o cliente que está gerando
             await send_evolution_text(
                 req.number,
@@ -1448,26 +1496,36 @@ async def evolution_inbound_direct(
             )
             log_event("rpa_started", number=req.number, device=device)
 
-            # Roda o robô (síncrono dentro do request — pode levar 30-90s)
-            result = await gerar_teste_sstv(
-                device=device or "",
-                cliente_nome=req.pushName or "",
-                cliente_numero=req.number,
-            )
+            # Chama o serviço RPA separado via HTTP
+            async with httpx.AsyncClient(timeout=150) as client:
+                resp = await client.post(
+                    f"{RPA_SERVICE_URL.rstrip('/')}/gerar-teste",
+                    headers={"X-API-Key": RPA_API_KEY},
+                    json={
+                        "device": device or "",
+                        "cliente_nome": req.pushName or "",
+                        "cliente_numero": req.number,
+                    },
+                )
+                result = resp.json()
 
-            if result.success and result.username and result.password:
-                # Envia as credenciais formatadas pro aparelho do cliente
-                mensagens = formatar_mensagem_cliente(result, device or "")
+            if result.get("success") and result.get("username"):
+                username = result["username"]
+                password = result.get("password", "")
+                validade = result.get("validade", "")
+
+                # Envia credenciais formatadas pro aparelho
+                mensagens = formatar_credenciais_cliente(username, password, device or "", validade)
                 if mensagens:
                     await send_evolution_messages(req.number, mensagens)
-                log_event("rpa_success", number=req.number, device=device)
-                rpa_result = {"success": True, "username": result.username}
-                # Atualiza o record do cliente
+                log_event("rpa_success", number=req.number, device=device, username=username)
+                rpa_result = {"success": True, "username": username}
+                # Atualiza record do cliente
                 record = store.get_customer(req.number)
-                record["test_username"] = result.username
+                record["test_username"] = username
                 record["test_generated_at"] = datetime.now(timezone.utc).isoformat()
                 store._set_json(f"customer:{req.number}", record)
-                # Avisa o Emiliano que o teste foi gerado automaticamente
+                # Avisa Emiliano
                 if EMILIANO_PHONE:
                     await send_evolution_text(
                         EMILIANO_PHONE,
@@ -1475,11 +1533,12 @@ async def evolution_inbound_direct(
                         f"Cliente: {req.pushName or 'sem nome'}\n"
                         f"WhatsApp: {req.number}\n"
                         f"Aparelho: {device or 'não informado'}\n"
-                        f"Usuário: {result.username}",
+                        f"Usuário: {username}",
                     )
             else:
-                # RPA falhou — avisa o cliente e escala pro Emiliano
-                log_event("rpa_failed", number=req.number, device=device, error=result.error)
+                # RPA falhou
+                error = result.get("error", "erro desconhecido")
+                log_event("rpa_failed", number=req.number, device=device, error=error)
                 await send_evolution_text(
                     req.number,
                     "Tive um probleminha pra gerar seu teste automaticamente 😕 "
@@ -1492,9 +1551,9 @@ async def evolution_inbound_direct(
                         f"Cliente: {req.pushName or 'sem nome'}\n"
                         f"WhatsApp: {req.number}\n"
                         f"Aparelho: {device or 'não informado'}\n"
-                        f"Erro: {result.error}",
+                        f"Erro: {error}",
                     )
-                rpa_result = {"success": False, "error": result.error}
+                rpa_result = {"success": False, "error": error}
         except Exception as exc:
             log_event("rpa_error", number=req.number, error=str(exc)[:300])
             rpa_result = {"success": False, "error": str(exc)[:300]}
