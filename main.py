@@ -1301,11 +1301,11 @@ async def rpa_test(x_api_key: Optional[str] = Header(default=None), api_key: Opt
 
     # Passo 1: Playwright importável?
     try:
-        import playwright
-        result["steps"].append({"step": "import_playwright", "ok": True, "version": playwright.__version__})
+        from playwright.async_api import async_playwright
+        result["steps"].append({"step": "import_playwright", "ok": True})
     except Exception as exc:
         result["steps"].append({"step": "import_playwright", "ok": False, "error": str(exc)[:200]})
-        result["summary"] = "Playwright não está instalado no container"
+        result["summary"] = "Playwright não está instalado no container. Verifique requirements.txt + Dockerfile."
         return result
 
     # Passo 2: Chromium lança?
