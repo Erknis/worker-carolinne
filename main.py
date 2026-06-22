@@ -70,6 +70,10 @@ RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "3600"))  # segundos
 
 # RPA SSTV — automação de geração de teste no painel sstv.center
 SSTV_RPA_ENABLED = os.getenv("SSTV_RPA_ENABLED", "false").lower() == "true"
+SSTV_LOGIN_URL = os.getenv("SSTV_LOGIN_URL", "https://sstv.center/")
+SSTV_USER = os.getenv("SSTV_USER", "")
+SSTV_PASS = os.getenv("SSTV_PASS", "")
+TWOCAPTCHA_API_KEY = os.getenv("TWOCAPTCHA_API_KEY", "")
 
 # ---------------------------------------------------------------------------
 # Logging estruturado
@@ -1277,6 +1281,67 @@ async def preview(req: EvolutionInbound, x_api_key: Optional[str] = Header(defau
     """Preview de resposta. Protegido por API key."""
     check_api_key(x_api_key)
     return await reply_for(req)
+
+
+@app.get("/rpa/test")
+async def rpa_test(x_api_key: Optional[str] = Header(default=None), api_key: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+    """Diagnóstico do RPA: testa Playwright, login do SSTV e captura erros passo a passo."""
+    check_api_key(x_api_key, api_key)
+
+    result: Dict[str, Any] = {"steps": [], "config": {}}
+
+    # Verifica config
+    result["config"] = {
+        "sstv_rpa_enabled": SSTV_RPA_ENABLED,
+        "sstv_login_url": SSTV_LOGIN_URL,
+        "sstv_user": SSTV_USER[:3] + "***" if SSTV_USER else "(vazio)",
+        "sstv_pass": "***" if SSTV_PASS else "(vazio)",
+        "twocaptcha_key": TWOCAPTCHA_API_KEY[:6] + "***" if TWOCAPTCHA_API_KEY else "(vazio)",
+    }
+
+    # Passo 1: Playwright importável?
+    try:
+        import playwright
+        result["steps"].append({"step": "import_playwright", "ok": True, "version": playwright.__version__})
+    except Exception as exc:
+        result["steps"].append({"step": "import_playwright", "ok": False, "error": str(exc)[:200]})
+        result["summary"] = "Playwright não está instalado no container"
+        return result
+
+    # Passo 2: Chromium lança?
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            result["steps"].append({"step": "chromium_launch", "ok": True})
+            # Passo 3: Abre página de login?
+            try:
+                await page.goto(SSTV_LOGIN_URL, wait_until="networkidle", timeout=30000)
+                title = await page.title()
+                result["steps"].append({"step": "open_login_page", "ok": True, "title": title, "url": page.url})
+                # Captura parte do HTML pra ver a estrutura
+                body_text = (await page.inner_text("body"))[:500]
+                result["steps"].append({"step": "login_page_text", "text_preview": body_text[:300]})
+            except Exception as exc:
+                result["steps"].append({"step": "open_login_page", "ok": False, "error": str(exc)[:200]})
+            await browser.close()
+    except Exception as exc:
+        result["steps"].append({"step": "chromium_launch", "ok": False, "error": str(exc)[:200]})
+        result["summary"] = "Chromium não conseguiu iniciar (deps do sistema faltando?)"
+        return result
+
+    # Passo 4: Testa 2Captcha (saldo)
+    if TWOCAPTCHA_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(f"https://2captcha.com/res.php?key={TWOCAPTCHA_API_KEY}&action=getbalance")
+                result["steps"].append({"step": "twocaptcha_balance", "ok": True, "response": resp.text})
+        except Exception as exc:
+            result["steps"].append({"step": "twocaptcha_balance", "ok": False, "error": str(exc)[:200]})
+
+    result["summary"] = "Diagnóstico completo. Veja os steps acima."
+    return result
 
 
 def normalize_evolution_payload(body: Dict[str, Any]) -> EvolutionInbound:
