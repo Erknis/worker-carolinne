@@ -20,7 +20,7 @@ except Exception:  # pragma: no cover
     redis = None
 
 # ---------------------------------------------------------------------------
-# Configuração
+# Configuração (settings)
 # ---------------------------------------------------------------------------
 APP_NAME = os.getenv("BOT_NAME", "Carolinne")
 API_KEY = os.getenv("CAROLINNE_WORKER_API_KEY", "")
