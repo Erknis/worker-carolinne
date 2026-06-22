@@ -574,6 +574,8 @@ def rules_reply(req: EvolutionInbound) -> WorkerReply:
         return WorkerReply(
             intent=intent,
             reply_text=(
+                f"Você consegue pagar em reais (Pix)? 🇧🇷\n"
+                f"Se sim, segue os dados:\n\n"
                 f"Para finalizar seu acesso, segue os dados do Pix:\n"
                 f"🇧🇷 Chave Pix (CPF): {PIX_KEY}\n"
                 f"👤 Nome: Emiliano Louzada de Oliveira\n"
@@ -586,9 +588,17 @@ def rules_reply(req: EvolutionInbound) -> WorkerReply:
         return WorkerReply(
             intent=intent,
             reply_text=(
-                "Esse tipo de pagamento é pelo nosso site:\nwww.liberoutv.com\n\n"
-                "Entra no site, clica no seu país, toca em Acessar Agora e escolhe o plano.\n"
-                "Depois me manda o comprovante aqui."
+                "Sem problema! Aceitamos cartão de crédito na sua moeda pelo nosso site. 🌍\n\n"
+                "Como pagar! Acesse o site abaixo:\n"
+                "👉 www.liberoutv.com\n\n"
+                "✅ É simples e rápido:\n"
+                "1. Entre no site\n"
+                "2. Clique no seu país\n"
+                "3. Toque em 'Acessar Agora'\n"
+                "4. Clique em automático!\n"
+                "5. Escolha seu plano\n"
+                "6. Realize o pagamento\n\n"
+                "Manda o comprovante aqui pra mim e pronto — tudo certo! 🚀"
             ),
         )
     if intent == "comprovante":
@@ -826,10 +836,10 @@ def sanitize_reply(req: EvolutionInbound, reply: WorkerReply) -> WorkerReply:
             text = re.sub(pattern, "", text, flags=re.I).strip()
 
     t = normalize(req.text)
-    if any(k in t for k in ["áudio", "audio", "ligação", "ligacao"]):
-        text = "Não consigo atender ligação/áudio por aqui agora.\nMe manda por texto ou uma foto da tela que eu te ajudo rapidinho."
+    if any(k in t for k in ["áudio", "audio", "ligação", "ligacao", "videochamada", "video chamada", "posso ligar", "ligar pra voce", "ligar pra você"]):
+        text = "Desculpa, o sistema não reproduz áudio nem permite ligações por aqui 😕\nMe manda sua dúvida por texto que eu te ajudo na hora!"
         reply.human_handoff = True
-        reply.handoff_reason = reply.handoff_reason or "cliente enviou áudio/ligação"
+        reply.handoff_reason = reply.handoff_reason or "cliente enviou áudio/solicitou ligação"
 
     if reply.intent != "pix":
         text = strip_decorative_emojis(text)
@@ -1005,21 +1015,26 @@ async def build_reply(req: EvolutionInbound) -> WorkerReply:
 def post_process_test_flow(req: EvolutionInbound, reply: WorkerReply) -> WorkerReply:
     """Pós-processa a resposta do LLM/regras pra aplicar a lógica do fluxo de teste.
 
-    O LLM costuma marcar human_handoff=true em todo pedido de teste, o que
-    impede o RPA de disparar. Esta função decide o handoff com base no
-    estado real da conversa (aparelho detectado ou não).
+    O LLM costuma marcar human_handoff=true em todo pedido de teste, ou troca
+    o intent pra "apps" quando o cliente menciona aparelho. Esta função
+    normaliza tudo com base no estado real da conversa.
     """
-    if reply.intent != "gerar_teste":
+    await_state = store.get_state(req.number)
+    device = detect_device(req.text)
+    raw_text = normalize(req.text)
+    # Detecta se o cliente mencionou "teste" na mensagem atual
+    wants_test = any(k in raw_text for k in ["teste", "testar", "experimentar", "trial"])
+    # Ou se já estava em fluxo de teste (aguardando aparelho)
+    in_test_flow = await_state == "await_device" or wants_test
+
+    if not in_test_flow:
         return reply
 
-    await_state = store.get_state(req.number)
-    device = reply.metadata.get("device") or detect_device(req.text)
-
-    # Cliente disse o aparelho junto com o pedido de teste, OU estava aguardando
-    # aparelho e acabou de responder → temos tudo pra gerar o teste.
-    if device and (await_state == "await_device" or not await_state):
+    # Cliente disse o aparelho (junto com teste OU respondendo após pergunta)
+    if device:
         store.clear_state(req.number)
         store.set_device(req.number, device)
+        reply.intent = "gerar_teste"
         reply.metadata["device"] = device
         reply.metadata["test_ready_to_generate"] = True
         reply.human_handoff = True
@@ -1030,14 +1045,14 @@ def post_process_test_flow(req: EvolutionInbound, reply: WorkerReply) -> WorkerR
         )
         return reply
 
-    # Cliente pediu teste mas não disse o aparelho → pergunta e ativa estado.
-    # NÃO faz handoff (não há nada pro humano/RPA fazer ainda).
-    store.set_state(req.number, "await_device")
-    reply.metadata["await_state"] = "await_device"
-    reply.metadata["test_ready_to_generate"] = False
-    reply.human_handoff = False
-    reply.handoff_reason = None
-    if not req.text or detect_device(req.text) is None:
+    # Cliente está no fluxo de teste mas ainda não disse aparelho
+    # (só processa se o intent for gerar_teste, senão deixa o apps/suporte seguir)
+    if reply.intent == "gerar_teste":
+        store.set_state(req.number, "await_device")
+        reply.metadata["await_state"] = "await_device"
+        reply.metadata["test_ready_to_generate"] = False
+        reply.human_handoff = False
+        reply.handoff_reason = None
         reply.reply_text = "Claro 😊 Eu gero o teste por aqui.\nMe diz só em qual aparelho vai usar?"
     return reply
 
