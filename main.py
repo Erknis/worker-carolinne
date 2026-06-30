@@ -68,9 +68,12 @@ BRAIN_PATH = Path(os.getenv("CAROLINNE_BRAIN_PATH", "carolinne_brain.md"))
 RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "20"))
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "3600"))  # segundos
 
-# RPA SSTV — o robô agora roda num serviço separado (worker-rpa-sstv).
-# O worker só faz uma chamada HTTP pra ele.
+# RPA SSTV — modo PC em casa (Chrome real) ou serviço separado (EasyPanel).
+# RPA_MODE=pc   → o PC em casa processa a fila via /fila/testes
+# RPA_MODE=api  → chama o serviço worker-rpa-sstv (EasyPanel)
+# RPA_MODE=off  → só notifica Emiliano (manual)
 SSTV_RPA_ENABLED = os.getenv("SSTV_RPA_ENABLED", "false").lower() == "true"
+RPA_MODE = os.getenv("RPA_MODE", "off").lower()  # pc | api | off
 RPA_SERVICE_URL = os.getenv("RPA_SERVICE_URL", "http://liberoutv_worker-rpa-sstv:8001")
 RPA_API_KEY = os.getenv("RPA_API_KEY", "")
 
@@ -1305,6 +1308,100 @@ def get_metrics(x_api_key: Optional[str] = Header(default=None), api_key: Option
     return metrics.snapshot()
 
 
+# ---------------------------------------------------------------------------
+# Fila de testes — o PC em casa consome esses endpoints
+# ---------------------------------------------------------------------------
+@app.get("/fila/testes")
+def fila_testes(x_api_key: Optional[str] = Header(default=None), api_key: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+    """O PC em casa chama esse endpoint pra pegar testes pendentes."""
+    check_api_key(x_api_key, api_key)
+    key = "fila:testes"
+    fila = store._get_json(key)
+    pendentes = fila.get("pendentes", [])
+    return {"count": len(pendentes), "testes": pendentes}
+
+
+@app.post("/fila/testes/adicionar")
+async def fila_adicionar(req: EvolutionInbound, device: str = "", x_api_key: Optional[str] = Header(default=None)) -> Dict[str, Any]:
+    """Adiciona um teste na fila (interno — chamado pelo fluxo de teste)."""
+    check_api_key(x_api_key)
+    key = "fila:testes"
+    fila = store._get_json(key)
+    pendentes = fila.get("pendentes", [])
+    pedido = {
+        "id": f"test_{req.number}_{int(time.time())}",
+        "number": req.number,
+        "nome": req.pushName or "",
+        "device": device,
+        "status": "pendente",
+        "criado_em": datetime.now(timezone.utc).isoformat(),
+    }
+    pendentes.append(pedido)
+    store._set_json(key, {"pendentes": pendentes})
+    log_event("fila_teste_adicionado", number=req.number, device=device, id=pedido["id"])
+    return {"ok": True, "id": pedido["id"]}
+
+
+@app.post("/fila/testes/{pedido_id}/resultado")
+async def fila_resultado(pedido_id: str, x_api_key: Optional[str] = Header(default=None), request: Request = None) -> Dict[str, Any]:
+    """O PC em casa chama esse endpoint quando termina de gerar o teste."""
+    check_api_key(x_api_key)
+    body = await request.json()
+    username = body.get("username", "")
+    password = body.get("password", "")
+    validade = body.get("validade", "")
+    erro = body.get("error", "")
+
+    # Atualiza a fila
+    key = "fila:testes"
+    fila = store._get_json(key)
+    pendentes = fila.get("pendentes", [])
+    pedido = None
+    for p in pendentes:
+        if p["id"] == pedido_id:
+            pedido = p
+            if erro:
+                p["status"] = "erro"
+                p["error"] = erro
+            else:
+                p["status"] = "concluido"
+                p["username"] = username
+                p["password"] = password
+                p["validade"] = validade
+            p["concluido_em"] = datetime.now(timezone.utc).isoformat()
+            break
+    store._set_json(key, {"pendentes": pendentes})
+
+    if not pedido:
+        raise HTTPException(status_code=404, detail="Pedido não encontrado")
+
+    log_event("fila_teste_resultado", id=pedido_id, success=bool(username), error=erro)
+
+    # Se teve sucesso, envia credenciais pro cliente no WhatsApp
+    if username and password and pedido.get("number"):
+        mensagens = formatar_credenciais_cliente(username, password, pedido.get("device", ""), validade)
+        if mensagens:
+            try:
+                await send_evolution_messages(pedido["number"], mensagens)
+            except Exception as exc:
+                log_event("send_credenciais_failed", number=pedido["number"], error=str(exc)[:200])
+        # Avisa Emiliano
+        if EMILIANO_PHONE:
+            try:
+                await send_evolution_text(
+                    EMILIANO_PHONE,
+                    f"✅ Teste gerado automaticamente (PC)\n"
+                    f"Cliente: {pedido.get('nome', 'sem nome')}\n"
+                    f"WhatsApp: {pedido.get('number')}\n"
+                    f"Aparelho: {pedido.get('device', 'não informado')}\n"
+                    f"Usuário: {username}",
+                )
+            except Exception:
+                pass
+
+    return {"ok": True}
+
+
 @app.get("/customer/{number}")
 async def get_customer_debug(
     number: str,
@@ -1459,20 +1556,30 @@ async def evolution_inbound_direct(
     # Write-back leve de cliente no Supabase (assíncrono, sem bloquear resposta)
     safe_name = {"name": req.pushName} if req.pushName else {}
     if safe_name:
-        await supabase_upsert_customer(req.number, safe_name)
+        try:
+            await supabase_upsert_customer(req.number, safe_name)
+        except Exception as exc:
+            log_event("supabase_upsert_failed", number=req.number, error=str(exc)[:200])
 
     # Indicador "digitando" para o cliente não achar que travou
-    await send_evolution_typing(req.number)
+    try:
+        await send_evolution_typing(req.number)
+    except Exception as exc:
+        log_event("typing_failed_endpoint", number=req.number, error=str(exc)[:200])
 
     reply = await reply_for(req)
 
     # Se há mensagens extras (ex.: cumprimento + boas-vindas), envia com pausa
     # entre cada uma, e a reply_text é a última. Se não, envia reply_text direto.
     all_messages = list(reply.extra_messages) + [reply.reply_text]
-    if len(all_messages) > 1:
-        send_result = await send_evolution_messages(req.number, all_messages)
-    else:
-        send_result = await send_evolution_text(req.number, reply.reply_text)
+    try:
+        if len(all_messages) > 1:
+            send_result = await send_evolution_messages(req.number, all_messages)
+        else:
+            send_result = await send_evolution_text(req.number, reply.reply_text)
+    except Exception as exc:
+        log_event("send_failed", number=req.number, error=str(exc)[:300], evolution_url=EVOLUTION_API_URL)
+        send_result = {"error": str(exc)[:300], "evolution_url": EVOLUTION_API_URL}
 
     handoff_result = None
     try:
@@ -1480,12 +1587,49 @@ async def evolution_inbound_direct(
     except Exception as exc:
         handoff_result = {"error": str(exc)[:300]}
 
-    # ---- RPA SSTV (geração automática de teste via serviço separado) ----
+    # ---- RPA SSTV (geração automática de teste) ----
+    # RPA_MODE=pc   → coloca na fila pro PC em casa processar
+    # RPA_MODE=api  → chama o serviço worker-rpa-sstv (EasyPanel)
+    # RPA_MODE=off  → só notifica Emiliano (já feito no handoff acima)
     rpa_result = None
     if (
         reply.intent == "gerar_teste"
         and reply.metadata.get("test_ready_to_generate")
         and SSTV_RPA_ENABLED
+        and RPA_MODE == "pc"
+    ):
+        device = reply.metadata.get("device") or store.get_device(req.number)
+        try:
+            # Avisa o cliente que está na fila
+            await send_evolution_text(
+                req.number,
+                "Estou gerando seu teste agora 🔧 Só um minutinho...",
+            )
+            # Adiciona na fila (o PC em casa vai processar)
+            pedido_id = f"test_{req.number}_{int(time.time())}"
+            key = "fila:testes"
+            fila = store._get_json(key)
+            pendentes = fila.get("pendentes", [])
+            pendentes.append({
+                "id": pedido_id,
+                "number": req.number,
+                "nome": req.pushName or "",
+                "device": device or "",
+                "status": "pendente",
+                "criado_em": datetime.now(timezone.utc).isoformat(),
+            })
+            store._set_json(key, {"pendentes": pendentes})
+            log_event("fila_teste_adicionado", number=req.number, device=device, id=pedido_id)
+            rpa_result = {"success": True, "mode": "pc", "id": pedido_id}
+        except Exception as exc:
+            log_event("fila_error", number=req.number, error=str(exc)[:300])
+            rpa_result = {"success": False, "error": str(exc)[:300]}
+
+    elif (
+        reply.intent == "gerar_teste"
+        and reply.metadata.get("test_ready_to_generate")
+        and SSTV_RPA_ENABLED
+        and RPA_MODE == "api"
     ):
         device = reply.metadata.get("device") or store.get_device(req.number)
         try:
